@@ -1,0 +1,250 @@
+// WebSocket Configuration
+@Configuration
+@EnableWebSocket
+public class WebSocketConfig implements WebSocketConfigurer {
+
+    @Autowired
+    private TopicWebSocketHandler webSocketHandler;
+
+    @Override
+    public void registerWebSocketHandlers(WebSocketHandlerRegistry registry) {
+        registry.addHandler(webSocketHandler, "/ws")
+                .setAllowedOrigins("*"); // Configure origins as needed
+    }
+}
+
+// WebSocket Handler
+@Component
+public class TopicWebSocketHandler extends TextWebSocketHandler {
+
+    private final Map<String, Set<WebSocketSession>> topicSubscriptions = new ConcurrentHashMap<>();
+    private final Map<String, Set<String>> sessionTopics = new ConcurrentHashMap<>();
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Override
+    public void afterConnectionEstablished(WebSocketSession session) throws Exception {
+        System.out.println("WebSocket connection established: " + session.getId());
+        sessionTopics.put(session.getId(), ConcurrentHashMap.newKeySet());
+    }
+
+    @Override
+    protected void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
+        try {
+            JsonNode messageNode = objectMapper.readTree(message.getPayload());
+            String action = messageNode.get("action").asText();
+            String topic = messageNode.get("topic").asText();
+
+            switch (action) {
+                case "subscribe":
+                    handleSubscription(session, topic);
+                    break;
+                case "unsubscribe":
+                    handleUnsubscription(session, topic);
+                    break;
+                default:
+                    System.out.println("Unknown action: " + action);
+            }
+        } catch (Exception e) {
+            System.err.println("Error processing message: " + e.getMessage());
+        }
+    }
+
+    private void handleSubscription(WebSocketSession session, String topic) {
+        topicSubscriptions.computeIfAbsent(topic, k -> ConcurrentHashMap.newKeySet()).add(session);
+        sessionTopics.get(session.getId()).add(topic);
+        
+        System.out.println("Session " + session.getId() + " subscribed to topic: " + topic);
+        
+        // Send confirmation message
+        sendToSession(session, createMessage("subscription_confirmed", topic, "Successfully subscribed to " + topic));
+        
+        // Send initial data for the topic (optional)
+        sendInitialDataForTopic(session, topic);
+    }
+
+    private void handleUnsubscription(WebSocketSession session, String topic) {
+        Set<WebSocketSession> subscribers = topicSubscriptions.get(topic);
+        if (subscribers != null) {
+            subscribers.remove(session);
+            if (subscribers.isEmpty()) {
+                topicSubscriptions.remove(topic);
+            }
+        }
+        
+        Set<String> topics = sessionTopics.get(session.getId());
+        if (topics != null) {
+            topics.remove(topic);
+        }
+        
+        System.out.println("Session " + session.getId() + " unsubscribed from topic: " + topic);
+        
+        // Send confirmation message
+        sendToSession(session, createMessage("unsubscription_confirmed", topic, "Successfully unsubscribed from " + topic));
+    }
+
+    @Override
+    public void afterConnectionClosed(WebSocketSession session, CloseStatus status) throws Exception {
+        System.out.println("WebSocket connection closed: " + session.getId());
+        
+        // Clean up subscriptions for this session
+        Set<String> topics = sessionTopics.remove(session.getId());
+        if (topics != null) {
+            for (String topic : topics) {
+                Set<WebSocketSession> subscribers = topicSubscriptions.get(topic);
+                if (subscribers != null) {
+                    subscribers.remove(session);
+                    if (subscribers.isEmpty()) {
+                        topicSubscriptions.remove(topic);
+                    }
+                }
+            }
+        }
+    }
+
+    // Method to broadcast message to all subscribers of a topic
+    public void broadcastToTopic(String topic, Object data) {
+        Set<WebSocketSession> subscribers = topicSubscriptions.get(topic);
+        if (subscribers != null && !subscribers.isEmpty()) {
+            String message = createMessage("data", topic, data);
+            subscribers.forEach(session -> sendToSession(session, message));
+        }
+    }
+
+    // Method to send message to specific session
+    private void sendToSession(WebSocketSession session, String message) {
+        try {
+            if (session.isOpen()) {
+                session.sendMessage(new TextMessage(message));
+            }
+        } catch (Exception e) {
+            System.err.println("Error sending message to session " + session.getId() + ": " + e.getMessage());
+        }
+    }
+
+    // Create JSON message compatible with RxJS client
+    private String createMessage(String type, String topic, Object data) {
+        try {
+            Map<String, Object> message = new HashMap<>();
+            message.put("type", type);
+            message.put("topic", topic);
+            message.put("data", data);
+            message.put("timestamp", System.currentTimeMillis());
+            return objectMapper.writeValueAsString(message);
+        } catch (Exception e) {
+            System.err.println("Error creating message: " + e.getMessage());
+            return "{}";
+        }
+    }
+
+    // Send initial data when subscribing to a topic
+    private void sendInitialDataForTopic(WebSocketSession session, String topic) {
+        // Example: Send different initial data based on topic
+        switch (topic) {
+            case "user-updates":
+                sendToSession(session, createMessage("data", topic, 
+                    Map.of("userId", "123", "status", "online", "lastSeen", System.currentTimeMillis())));
+                break;
+            case "notifications":
+                sendToSession(session, createMessage("data", topic, 
+                    Map.of("message", "Welcome!", "priority", "info")));
+                break;
+            case "market-data":
+                sendToSession(session, createMessage("data", topic, 
+                    Map.of("symbol", "AAPL", "price", 150.25, "change", "+1.25")));
+                break;
+            default:
+                sendToSession(session, createMessage("data", topic, 
+                    Map.of("message", "Connected to " + topic)));
+        }
+    }
+
+    // Getter for checking active subscriptions (useful for debugging)
+    public Map<String, Set<WebSocketSession>> getTopicSubscriptions() {
+        return new HashMap<>(topicSubscriptions);
+    }
+}
+
+// Service to demonstrate sending data to topics
+@Service
+public class WebSocketMessageService {
+
+    @Autowired
+    private TopicWebSocketHandler webSocketHandler;
+
+    // Example method to send user updates
+    public void sendUserUpdate(String userId, String status) {
+        Map<String, Object> update = Map.of(
+            "userId", userId,
+            "status", status,
+            "timestamp", System.currentTimeMillis()
+        );
+        webSocketHandler.broadcastToTopic("user-updates", update);
+    }
+
+    // Example method to send notifications
+    public void sendNotification(String message, String priority) {
+        Map<String, Object> notification = Map.of(
+            "message", message,
+            "priority", priority,
+            "id", UUID.randomUUID().toString(),
+            "timestamp", System.currentTimeMillis()
+        );
+        webSocketHandler.broadcastToTopic("notifications", notification);
+    }
+
+    // Example method to send market data
+    public void sendMarketData(String symbol, double price, double change) {
+        Map<String, Object> marketData = Map.of(
+            "symbol", symbol,
+            "price", price,
+            "change", change,
+            "timestamp", System.currentTimeMillis()
+        );
+        webSocketHandler.broadcastToTopic("market-data", marketData);
+    }
+}
+
+// Optional: REST Controller to trigger messages (for testing)
+@RestController
+@RequestMapping("/api/websocket")
+public class WebSocketTestController {
+
+    @Autowired
+    private WebSocketMessageService messageService;
+
+    @PostMapping("/send-user-update")
+    public ResponseEntity<String> sendUserUpdate(@RequestParam String userId, @RequestParam String status) {
+        messageService.sendUserUpdate(userId, status);
+        return ResponseEntity.ok("User update sent");
+    }
+
+    @PostMapping("/send-notification")
+    public ResponseEntity<String> sendNotification(@RequestParam String message, @RequestParam(defaultValue = "info") String priority) {
+        messageService.sendNotification(message, priority);
+        return ResponseEntity.ok("Notification sent");
+    }
+
+    @PostMapping("/send-market-data")
+    public ResponseEntity<String> sendMarketData(@RequestParam String symbol, @RequestParam double price, @RequestParam double change) {
+        messageService.sendMarketData(symbol, price, change);
+        return ResponseEntity.ok("Market data sent");
+    }
+}
+
+// Dependencies needed in pom.xml:
+/*
+<dependencies>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-websocket</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+    <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-databind</artifactId>
+    </dependency>
+</dependencies>
+*/
